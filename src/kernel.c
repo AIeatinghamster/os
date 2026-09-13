@@ -1,4 +1,5 @@
 #include "idt.c"
+#include "ata.c"
 extern void keyboard_stub(void);
 void *memcpy(void *dest, const void *src, unsigned int n)
 {
@@ -21,6 +22,7 @@ void *memset(void *dest, int value, unsigned int n)
 
     return dest;
 }
+
 typedef struct String String;
 struct String{
     char text[160];
@@ -108,26 +110,104 @@ void type(char c){
 }
 
 #define CAPACITY 100
-
+#define FOLDER_SECTOR 1
+#define MAX_DISK_FOLDERS 10
+#define FS_SECTOR 0
+#define FS_FOLDER 1
+#define FS_FILE   2
+typedef struct {
+    char magic[8];
+    unsigned int version;
+    unsigned int folder_sector;
+} Superblock;
+typedef struct File File;
 typedef struct Folder Folder;
 typedef struct Array Array;
 typedef struct cmd cmd;
 typedef struct cmdArray cmdArray;
-typedef struct strArray strArray; 
+typedef struct strArray strArray;
+typedef struct {
+    char name[32];
 
+    unsigned int id;
+    unsigned int parent_id;
+    unsigned int type;
+    unsigned int used;
+} DiskFolder;
+void save_folder(char name[], unsigned int id, unsigned int parent_id)
+{
+    unsigned char buffer[512] = {0};
 
+    disk_read(FOLDER_SECTOR, buffer);
+
+    DiskFolder folder;
+    memset(&folder, 0, sizeof(DiskFolder));
+
+    int i = 0;
+
+    while (name[i] != '\0' && i < 31) {
+        folder.name[i] = name[i];
+        i++;
+    }
+
+    folder.name[i] = '\0';
+    folder.id = id;
+    folder.parent_id = parent_id;
+    folder.type = FS_FOLDER;
+    folder.used = 1;
+
+    int free_slot = -1;
+
+    for (int i = 0; i < MAX_DISK_FOLDERS; i++) {
+
+        DiskFolder *slot =
+            (DiskFolder *)(buffer + i * sizeof(DiskFolder));
+
+        if (slot->used == 1 && slot->id == id) {
+            return;
+        }
+
+        if (slot->used == 0 && free_slot == -1) {
+            free_slot = i;
+        }
+    }
+
+    if (free_slot == -1) {
+        print("disk folder table full", 1);
+        return;
+    }
+
+    DiskFolder *slot =
+        (DiskFolder *)(buffer +
+                       free_slot * sizeof(DiskFolder));
+
+    memcpy(slot, &folder, sizeof(DiskFolder));
+
+    disk_write(FOLDER_SECTOR, buffer);
+}
+struct File {
+    char name[100];
+    unsigned int size;
+    unsigned int start_sector;
+};
 struct Folder {
     char name[100];
     int id;
     Array *subfolders;
     int sub_chid;
     Folder *parent;
+    /*File *files;
+    int file_count;*/
 };
+
 struct Array {
-    Folder data[CAPACITY];
+    Folder *data[CAPACITY];
     int size;
 };
-void append(Array *arr, Folder value) {
+
+
+void append(Array *arr, Folder *value)
+{
     if (arr->size >= CAPACITY)
         return;
 
@@ -138,31 +218,53 @@ void append(Array *arr, Folder value) {
 char current_path_str[] = ".";
 Folder *current_folder;
 Folder *previous_current_folder;
-
+Folder folder_pool[CAPACITY];
 Array folder_subfolders[CAPACITY];
-void add_subfolder(Folder *fld, char name[]) {
-    Folder to_add;
+void add_subfolder(Folder *fld, char name[])
+{
+    id_counter++;
+    if (id_counter >= CAPACITY) {
+        print("too many folders", 1);
+        return;
+    }
+
+    Folder *to_add = &folder_pool[id_counter];
+
+    memset(to_add, 0, sizeof(Folder));
 
     int i = 0;
     while (name[i] != '\0' && i < 99) {
-        to_add.name[i] = name[i];
+        to_add->name[i] = name[i];
         i++;
     }
-    to_add.name[i] = '\0';
-    to_add.parent = fld;
-    id_counter++;
-    to_add.id = id_counter;
-    fld->sub_chid++;
-    to_add.sub_chid=0;
-    to_add.subfolders = &folder_subfolders[to_add.id];
+
+    to_add->name[i] = '\0';
+
+    to_add->id = id_counter;
+    to_add->parent = fld;
+    to_add->sub_chid = 0;
+
+    to_add->subfolders =
+        &folder_subfolders[id_counter];
+
+    to_add->subfolders->size = 0;
+
     append(fld->subfolders, to_add);
+
+    fld->sub_chid++;
+
+    save_folder(
+        to_add->name,
+        to_add->id,
+        fld->id
+    );
 }
 
-void print_subfolders(Folder *fld) {
+void print_subfolders(Folder *fld){
     Array *subf = fld->subfolders;
 
     for (int i = 0; i < subf->size; i++) {
-        print(subf->data[i].name, 1);
+        print(subf->data[i]->name, 1);
     }
 }
 struct strArray {
@@ -232,26 +334,35 @@ void process_cmd(cmd cmd) {
             cmdt.text[2] == '\0') {
 
         if (cmd.parms.size == 0) {
-            print("cd: missing argument", 1);
+        print("cd: missing argument", 1);
+        return;
+    }
+    if (comp_str(cmd.parms.data[0].text, "..")) {
+
+        if (current_folder->parent != 0)
+            current_folder = current_folder->parent;
+
+        return;
+    }
+
+    for (int i = 0;
+         i < current_folder->subfolders->size;
+         i++) {
+
+        Folder *child =
+            current_folder->subfolders->data[i];
+
+        if (comp_str(
+                child->name,
+                cmd.parms.data[0].text
+            )) {
+
+            current_folder = child;
             return;
         }
-        if (current_folder->parent != 0) {
-            current_folder = current_folder->parent;
-        }
+    }
 
-        for (int i = 0; i < current_folder->subfolders->size; i++) {
-
-            if (comp_str(
-                    current_folder->subfolders->data[i].name,
-                    cmd.parms.data[0].text
-                )) {
-                previous_current_folder=current_folder;
-                current_folder = &current_folder->subfolders->data[i];
-                return;
-            }
-        }
-
-        print("cd: folder not found", 1);
+    print("cd: folder not found", 1);
     }
     else if (cmdt.text[0] == 'm' && cmdt.text[1] == 'k' && cmdt.text[2] == 'd' && cmdt.text[3] == 'i' && cmdt.text[4] == 'r'){
         add_subfolder(current_folder, cmd.parms.data[0].text);
@@ -470,13 +581,125 @@ void init_filesystem(void)
 
     root.parent = 0;
 
-    current_folder = &root;
 
     for (int i = 0; i < CAPACITY; i++) {
         folder_subfolders[i].size = 0;
     }
 }
+void load_folder_parents(void)
+{
+    unsigned char buffer[512] = {0};
+
+    disk_read(FOLDER_SECTOR, buffer);
+
+    for (int i = 0; i < MAX_DISK_FOLDERS; i++) {
+
+        DiskFolder disk_folder;
+
+        memcpy(
+            &disk_folder,
+            buffer + i * sizeof(DiskFolder),
+            sizeof(DiskFolder)
+        );
+
+        if (disk_folder.used == 0)
+            continue;
+
+        if (disk_folder.type != FS_FOLDER)
+            continue;
+
+        if (disk_folder.id == 0)
+            continue;
+
+        if (disk_folder.id >= CAPACITY)
+            continue;
+
+        Folder *folder =
+            &folder_pool[disk_folder.id];
+
+        if (disk_folder.parent_id == 0) {
+
+            folder->parent = &root;
+            root.sub_chid++;
+            append(
+                root.subfolders,
+                folder
+            );
+
+        } else {
+
+            if (disk_folder.parent_id >= CAPACITY)
+                continue;
+
+            Folder *parent =
+                &folder_pool[disk_folder.parent_id];
+
+            folder->parent = parent;
+            parent->sub_chid++;
+            append(
+                parent->subfolders,
+                folder
+            );
+        }
+    }
+    current_folder = &root;
+}
+void load_folders(void)
+{
+    unsigned char buffer[512] = {0};
+
+    disk_read(FOLDER_SECTOR, buffer);
+
+    for (int i = 0; i < MAX_DISK_FOLDERS; i++) {
+
+        DiskFolder disk_folder;
+
+        memcpy(
+            &disk_folder,
+            buffer + i * sizeof(DiskFolder),
+            sizeof(DiskFolder)
+        );
+
+        
+        if (disk_folder.used == 0)
+            continue;
+
+        if (disk_folder.type != FS_FOLDER)
+            continue;
+
+        if (disk_folder.id == 0)
+            continue;
+
+        if (disk_folder.id >= CAPACITY)
+            continue;
+
+        Folder *folder = &folder_pool[disk_folder.id];
+        if (disk_folder.id > id_counter)
+            id_counter = disk_folder.id;
+        memset(folder, 0, sizeof(Folder));
+
+        memcpy(
+            folder->name,
+            disk_folder.name,
+            32
+        );
+
+        folder->id = disk_folder.id;
+
+        folder->subfolders =
+            &folder_subfolders[disk_folder.id];
+
+        folder->subfolders->size = 0;
+
+        folder->sub_chid = 0;
+        folder->parent = 0;
+    }
+}
 void kernel_main(void){
+    init_filesystem();
+    load_folders();
+    load_folder_parents();
+
     unsigned short cs;
 
     __asm__ volatile (
@@ -494,9 +717,7 @@ void kernel_main(void){
     load_idt();
     pic_remap();
     __asm__ volatile ("sti");
-    init_filesystem();
-
-
+    
     while (1) {
         __asm__ volatile ("hlt");
     }
